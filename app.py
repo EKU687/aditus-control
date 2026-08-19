@@ -27,6 +27,26 @@ def obtenir_date_nc():
     """Renvoie l'objet date exact en Nouvelle-Calédonie (Pacific/Noumea)."""
     return datetime.datetime.now(ZoneInfo("Pacific/Noumea")).date()
 
+def verifier_creneau_horaire(h_entree_str: str, tolerance_minutes: int = 15) -> bool:
+    """
+    Vérifie si l'heure actuelle à Nouméa est supérieure ou égale 
+    à l'heure d'entrée prévue moins la tolérance (ex: -15 min).
+    """
+    if not h_entree_str:
+        return True
+    
+    try:
+        maintenant = datetime.datetime.now(ZoneInfo("Pacific/Noumea")).time()
+        h_prevue = datetime.datetime.strptime(str(h_entree_str)[:5], "%H:%M").time()
+        
+        dt_prevue = datetime.datetime.combine(obtenir_date_nc(), h_prevue)
+        dt_ouverture = dt_prevue - datetime.timedelta(minutes=tolerance_minutes)
+        heure_ouverture = dt_ouverture.time()
+        
+        return maintenant >= heure_ouverture
+    except Exception:
+        return True
+
 @st.cache_resource
 def init_connection() -> Client:
     url = st.secrets["SUPABASE_URL"]
@@ -64,21 +84,15 @@ def epurer_chaine(texte: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(texte).strip().upper())
 
 def isoler_plaque_nc(texte_brut: str) -> str:
-    """
-    Extrait uniquement le motif d'une plaque NC (ex: 123456NC ou 123456)
-    en ignorant la marque du véhicule ou autres textes parasites.
-    """
     if not texte_brut:
         return ""
     
     texte_clean = re.sub(r"[^A-Z0-9]", "", str(texte_brut).upper())
     
-    # 1. Motif exact : 1 à 6 chiffres suivis de 'NC'
     match_nc = re.search(r"(\d{1,6}NC)", texte_clean)
     if match_nc:
         return match_nc.group(1)
     
-    # 2. Motif secondaire : bloc isolé de 5 à 6 chiffres (ex: 356198)
     match_chiffres = re.search(r"(\d{5,6})", texte_clean)
     if match_chiffres:
         return f"{match_chiffres.group(1)}NC"
@@ -91,11 +105,6 @@ def reinitialiser_recherche():
         del st.session_state["photo_immat"]
 
 def extraire_texte_image(image_bytes):
-    """
-    Analyse l'image capturée en gérant :
-    - Les plaques classiques (chiffres noirs sur fond blanc)
-    - Les plaques administratives (chiffres blancs sur fond bleu)
-    """
     reader = charger_moteur_ocr()
     if reader is None:
         return ""
@@ -130,7 +139,6 @@ def verifier_acces_site(recherche_texte: str, site_poste_garde: str):
         matches = []
         
         for d in resultats:
-            # Sécurité supplémentaire sur le site
             if str(d.get("site_id")).upper() != str(site_poste_garde).upper():
                 continue
 
@@ -145,7 +153,8 @@ def verifier_acces_site(recherche_texte: str, site_poste_garde: str):
                                recherche_texte.lower() in conducteur)
             
             if match_immat or match_texte:
-                matches.append(d)
+                if verifier_creneau_horaire(d.get("heure_entree"), tolerance_minutes=15):
+                    matches.append(d)
                 
         return matches, len(resultats)
     except Exception as e:
@@ -167,7 +176,6 @@ site_selectionne = st.selectbox(
 date_aujourdhui = obtenir_date_nc()
 st.caption(f"📅 Date du jour : **{date_aujourdhui.strftime('%d/%m/%Y')}** | Site actif : **{site_selectionne}**")
 
-# Choix du mode de contrôle
 tab_clavier, tab_camera = st.tabs(["⌨️ Saisie Manuelle", "📸 Scanner via Webcam"])
 
 recherche_active = ""
@@ -195,7 +203,6 @@ with tab_camera:
         else:
             st.warning("⚠️ Aucune plaque NC lisible détectée. Rapprochez la plaque ou saisissez-la manuellement.")
 
-# Boutons d'action
 col_search, col_clear = st.columns([3, 1])
 with col_search:
     btn_verifier = st.button("VÉRIFIER L'ACCÈS 🚀", type="primary")
@@ -238,8 +245,9 @@ if btn_verifier or recherche_active.strip():
                 h_entree = str(d.get('heure_entree', '00:00:00'))[:5]
                 h_sortie = str(d.get('heure_sortie', '23:59:00'))[:5]
                 
-                st.info(f"📅 Validité : **du {d_entree} au {d_sortie}**\n\n🕒 Horaires autorisés : **de {h_entree} à {h_sortie}**")
+                st.info(f"📅 **Validité :** du {d_entree} au {d_sortie}\n\n"
+                        f"🕒 **Horaires :** de {h_entree} à {h_sortie} *(Accès autorisé dès {h_entree} -15 min)*")
                 st.divider()
         else:
             st.error(f"🔴 **ACCÈS REFUSÉ POUR LE SITE {site_selectionne}**")
-            st.warning(f"Aucune autorisation active trouvée à **{site_selectionne}** pour **{recherche_active}** à la date du **{date_aujourdhui.strftime('%d/%m/%Y')}**.")
+            st.warning(f"Aucune autorisation active ou valide actuellement à **{site_selectionne}** pour **{recherche_active}**.")
