@@ -87,30 +87,40 @@ def reinitialiser_recherche():
         del st.session_state["photo_immat"]
 
 def extraire_texte_image(image_bytes):
-    """Analyse l'image capturée avec un pré-traitement pour améliorer la lecture."""
+    """
+    Analyse l'image capturée en gérant :
+    - Les plaques classiques (chiffres noirs sur fond blanc)
+    - Les plaques administratives (chiffres blancs sur fond bleu)
+    """
     reader = charger_moteur_ocr()
     if reader is None:
         return ""
     
-    # Conversion en image PIL puis en tableau numpy pour OpenCV
+    # 1. Chargement de l'image
     image = Image.open(image_bytes)
     image_np = np.array(image)
     
-    # --- PRÉ-TRAITEMENT POUR L'OCR ---
-    # 1. Convertir en niveaux de gris
+    # 2. Conversion en niveaux de gris
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
     
-    # 2. Augmenter le contraste (Seuillage adaptatif)
-    # Cela permet d'isoler les caractères (noir) du fond (blanc/gris)
-    processed_image = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
+    # 3. Amélioration du contraste (Égalisation d'histogramme)
+    gray_contrast = cv2.equalizeHist(gray)
     
-    # Exécution de l'OCR sur l'image traitée
-    resultats = reader.readtext(processed_image, detail=0)
-    texte_brut = " ".join(resultats)
+    # 4. Création de la version "Négatif" (inversion des couleurs)
+    # Les chiffres blancs sur fond bleu deviennent des chiffres noirs sur fond clair !
+    gray_negative = cv2.bitwise_not(gray_contrast)
     
-    return isoler_plaque_nc(texte_brut)
+    # 5. Lecture OCR sur l'image classique
+    resultats_normaux = reader.readtext(gray_contrast, detail=0)
+    
+    # 6. Lecture OCR sur l'image en négatif
+    resultats_negatifs = reader.readtext(gray_negative, detail=0)
+    
+    # 7. Regroupement de tous les textes détectés
+    texte_global = " ".join(resultats_normaux + resultats_negatifs)
+    
+    # 8. Extraction de la plaque NC via notre Regex
+    return isoler_plaque_nc(texte_global)
 
 def verifier_acces_site(recherche_texte: str, site_poste_garde: str):
     date_jour = datetime.date.today().strftime("%Y-%m-%d")
