@@ -6,6 +6,7 @@ import pandas as pd
 from PIL import Image
 import numpy as np
 from supabase import create_client, Client
+from zoneinfo import ZoneInfo
 
 # ==========================================
 # 0. CONFIGURATION & STYLE MOBILE / WEBCAM
@@ -20,8 +21,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. INITIALISATION SUPABASE
+# 1. INITIALISATION SUPABASE ET FUSEAU HORAIRE
 # ==========================================
+def obtenir_date_nc():
+    """Renvoie l'objet date exact en Nouvelle-Calédonie (Pacific/Noumea)."""
+    return datetime.datetime.now(ZoneInfo("Pacific/Noumea")).date()
+
 @st.cache_resource
 def init_connection() -> Client:
     url = st.secrets["SUPABASE_URL"]
@@ -78,7 +83,6 @@ def isoler_plaque_nc(texte_brut: str) -> str:
     if match_chiffres:
         return f"{match_chiffres.group(1)}NC"
     
-    # Si aucun motif strict n'est trouvé, retourne la chaîne épurée brute
     return texte_clean
 
 def reinitialiser_recherche():
@@ -96,34 +100,21 @@ def extraire_texte_image(image_bytes):
     if reader is None:
         return ""
     
-    # 1. Chargement de l'image
     image = Image.open(image_bytes)
     image_np = np.array(image)
     
-    # 2. Conversion en niveaux de gris
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-    
-    # 3. Amélioration du contraste (Égalisation d'histogramme)
     gray_contrast = cv2.equalizeHist(gray)
-    
-    # 4. Création de la version "Négatif" (inversion des couleurs)
-    # Les chiffres blancs sur fond bleu deviennent des chiffres noirs sur fond clair !
     gray_negative = cv2.bitwise_not(gray_contrast)
     
-    # 5. Lecture OCR sur l'image classique
     resultats_normaux = reader.readtext(gray_contrast, detail=0)
-    
-    # 6. Lecture OCR sur l'image en négatif
     resultats_negatifs = reader.readtext(gray_negative, detail=0)
     
-    # 7. Regroupement de tous les textes détectés
     texte_global = " ".join(resultats_normaux + resultats_negatifs)
-    
-    # 8. Extraction de la plaque NC via notre Regex
     return isoler_plaque_nc(texte_global)
 
 def verifier_acces_site(recherche_texte: str, site_poste_garde: str):
-    date_jour = datetime.date.today().strftime("%Y-%m-%d")
+    date_jour = obtenir_date_nc().strftime("%Y-%m-%d")
     saisie_epuree = epurer_chaine(recherche_texte)
     
     try:
@@ -139,6 +130,10 @@ def verifier_acces_site(recherche_texte: str, site_poste_garde: str):
         matches = []
         
         for d in resultats:
+            # Sécurité supplémentaire sur le site
+            if str(d.get("site_id")).upper() != str(site_poste_garde).upper():
+                continue
+
             immat_db = epurer_chaine(d.get("vehicule_immatriculation"))
             demandeur = str(d.get("email_demandeur", "")).lower()
             organisme = str(d.get("organisme", "")).lower()
@@ -169,7 +164,8 @@ site_selectionne = st.selectbox(
     index=0
 )
 
-st.caption(f"📅 Date du jour : **{datetime.date.today().strftime('%d/%m/%Y')}** | Site actif : **{site_selectionne}**")
+date_aujourdhui = obtenir_date_nc()
+st.caption(f"📅 Date du jour : **{date_aujourdhui.strftime('%d/%m/%Y')}** | Site actif : **{site_selectionne}**")
 
 # Choix du mode de contrôle
 tab_clavier, tab_camera = st.tabs(["⌨️ Saisie Manuelle", "📸 Scanner via Webcam"])
@@ -195,7 +191,6 @@ with tab_camera:
             
         if plaque_detectee:
             st.success(f"🤖 **Plaque détectée :** `{plaque_detectee}`")
-            # Champ permettant d'ajuster rapidement si un caractère a été mal lu
             recherche_active = st.text_input("Ajuster la plaque si nécessaire :", value=plaque_detectee, key="correction_ocr")
         else:
             st.warning("⚠️ Aucune plaque NC lisible détectée. Rapprochez la plaque ou saisissez-la manuellement.")
@@ -238,10 +233,13 @@ if btn_verifier or recherche_active.strip():
                             st.markdown(f"🚘 **Véhicule :** {d.get('vehicule_type')}")
                             st.markdown(f"🪪 **Conducteur :** {d.get('vehicule_conducteur')}")
                 
+                d_entree = str(d.get('date_entree', ''))
+                d_sortie = str(d.get('date_sortie', ''))
                 h_entree = str(d.get('heure_entree', '00:00:00'))[:5]
                 h_sortie = str(d.get('heure_sortie', '23:59:00'))[:5]
-                st.info(f"🕒 Horaires autorisés : de **{h_entree}** à **{h_sortie}**")
+                
+                st.info(f"📅 Validité : **du {d_entree} au {d_sortie}**\n\n🕒 Horaires autorisés : **de {h_entree} à {h_sortie}**")
                 st.divider()
         else:
             st.error(f"🔴 **ACCÈS REFUSÉ POUR LE SITE {site_selectionne}**")
-            st.warning(f"Aucune autorisation active trouvée à **{site_selectionne}** pour **{recherche_active}**.")
+            st.warning(f"Aucune autorisation active trouvée à **{site_selectionne}** pour **{recherche_active}** à la date du **{date_aujourdhui.strftime('%d/%m/%Y')}**.")
