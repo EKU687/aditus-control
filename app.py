@@ -1,180 +1,233 @@
-import streamlit as st
-import cv2
 import datetime
 import re
+from zoneinfo import ZoneInfo
+
+import cv2
+import numpy as np
 import pandas as pd
 from PIL import Image
-import numpy as np
+import streamlit as st
 from supabase import create_client, Client
-from zoneinfo import ZoneInfo
 
 # ==========================================
 # 0. CONFIGURATION & STYLE MOBILE / WEBCAM
 # ==========================================
 st.set_page_config(page_title="ADITUS-CONTROL V2", page_icon="👮‍♂️", layout="centered")
 
-st.markdown("""
+st.markdown(
+    """
     <style>
         .stButton>button { width: 100%; height: 3.5em; font-size: 20px !important; font-weight: bold; }
         .main-header { text-align: center; color: #0056b3; margin-bottom: 10px; }
+        .stAlert { font-size: 16px; }
     </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
 
 # ==========================================
 # 1. INITIALISATION SUPABASE ET FUSEAU HORAIRE
 # ==========================================
-def obtenir_date_nc():
-    """Renvoie l'objet date exact en Nouvelle-Calédonie (Pacific/Noumea)."""
+def obtenir_date_nc() -> datetime.date:
+    """Renvoie la date exacte en Nouvelle-Calédonie (Pacific/Noumea)."""
     return datetime.datetime.now(ZoneInfo("Pacific/Noumea")).date()
 
-def verifier_creneau_horaire(h_entree_str: str, tolerance_minutes: int = 15) -> bool:
+
+def verifier_creneau_horaire(
+    h_entree_str: str, h_sortie_str: str = None, tolerance_minutes: int = 15
+) -> bool:
     """
-    Vérifie si l'heure actuelle à Nouméa est supérieure ou égale 
-    à l'heure d'entrée prévue moins la tolérance (ex: -15 min).
+    Vérifie si l'heure actuelle à Nouméa respecte la plage horaire d'accès autorisée
+    (avec une tolérance à l'entrée et éventuellement à la sortie).
     """
-    if not h_entree_str:
-        return True
-    
     try:
         maintenant = datetime.datetime.now(ZoneInfo("Pacific/Noumea")).time()
-        h_prevue = datetime.datetime.strptime(str(h_entree_str)[:5], "%H:%M").time()
-        
-        dt_prevue = datetime.datetime.combine(obtenir_date_nc(), h_prevue)
-        dt_ouverture = dt_prevue - datetime.timedelta(minutes=tolerance_minutes)
-        heure_ouverture = dt_ouverture.time()
-        
-        return maintenant >= heure_ouverture
+
+        # 1. Vérification de l'heure d'entrée (si renseignée)
+        if h_entree_str:
+            h_prevue = datetime.datetime.strptime(str(h_entree_str)[:5], "%H:%M").time()
+            dt_prevue = datetime.datetime.combine(obtenir_date_nc(), h_prevue)
+            dt_ouverture = dt_prevue - datetime.timedelta(minutes=tolerance_minutes)
+            if maintenant < dt_ouverture.time():
+                return False  # Trop tôt
+
+        # 2. Vérification de l'heure de sortie (si renseignée)
+        if h_sortie_str:
+            h_fin = datetime.datetime.strptime(str(h_sortie_str)[:5], "%H:%M").time()
+            dt_fin = datetime.datetime.combine(obtenir_date_nc(), h_fin)
+            dt_fermeture = dt_fin + datetime.timedelta(minutes=tolerance_minutes)
+            if maintenant > dt_fermeture.time():
+                return False  # Trop tard
+
+        return True
     except Exception:
         return True
+
 
 @st.cache_resource
 def init_connection() -> Client:
     url = st.secrets["SUPABASE_URL"]
-    key = st.secrets.get("SUPABASE_SERVICE_KEY", st.secrets["SUPABASE_KEY"])
+    # Utilisation prioritaire de la Service Role Key pour contourner RLS en mode lecture seule vigile
+    key = st.secrets.get("SUPABASE_SERVICE_KEY") or st.secrets.get("SUPABASE_KEY")
     return create_client(url, key)
+
 
 supabase = init_connection()
 
-@st.cache_data(ttl=3600)
+
+@st.cache_data(
+    ttl=300
+)  # Réduction du cache à 5 min pour prendre en compte les validations rapides
 def charger_sites():
     try:
         req = supabase.table("Demandes_acces").select("site_id").execute()
-        sites = sorted(list(set([row["site_id"] for row in req.data if row.get("site_id")])))
+        sites = sorted(
+            list(set([row["site_id"] for row in req.data if row.get("site_id")]))
+        )
         return sites if sites else ["DINUM", "DOUMER"]
     except Exception:
         return ["DINUM", "DOUMER"]
+
 
 # Chargement du moteur OCR (EasyOCR)
 @st.cache_resource
 def charger_moteur_ocr():
     try:
         import easyocr
-        reader = easyocr.Reader(['en'], gpu=False)
+
+        # Initialisation légère du reader
+        reader = easyocr.Reader(["en"], gpu=False)
         return reader
     except Exception as e:
         st.warning(f"⚠️ Moteur OCR non disponible : {e}")
         return None
 
+
 # ==========================================
-# 2. LOGIQUE METIER & OCR
+# 2. LOGIQUE MÉTIER & OCR
 # ==========================================
 def epurer_chaine(texte: str) -> str:
     if not texte:
         return ""
     return re.sub(r"[^A-Z0-9]", "", str(texte).strip().upper())
 
+
 def isoler_plaque_nc(texte_brut: str) -> str:
     if not texte_brut:
         return ""
-    
-    texte_clean = re.sub(r"[^A-Z0-9]", "", str(texte_brut).upper())
-    
+
+    texte_clean = epurer_chaine(texte_brut)
+
+    # Motifs d'immatriculation Nouvelle-Calédonie (ex: 123456NC ou 456913)
     match_nc = re.search(r"(\d{1,6}NC)", texte_clean)
     if match_nc:
         return match_nc.group(1)
-    
+
     match_chiffres = re.search(r"(\d{5,6})", texte_clean)
     if match_chiffres:
         return f"{match_chiffres.group(1)}NC"
-    
+
     return texte_clean
+
 
 def reinitialiser_recherche():
     st.session_state["champ_recherche"] = ""
     if "photo_immat" in st.session_state:
         del st.session_state["photo_immat"]
+    if "correction_ocr" in st.session_state:
+        del st.session_state["correction_ocr"]
 
-def extraire_texte_image(image_bytes):
+
+def extraire_texte_image(image_bytes) -> str:
     reader = charger_moteur_ocr()
     if reader is None:
         return ""
-    
+
     image = Image.open(image_bytes)
     image_np = np.array(image)
-    
+
+    # Conversion en niveau de gris & traitements d'image
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
     gray_contrast = cv2.equalizeHist(gray)
     gray_negative = cv2.bitwise_not(gray_contrast)
-    
+
+    # OCR sur les deux variantes
     resultats_normaux = reader.readtext(gray_contrast, detail=0)
     resultats_negatifs = reader.readtext(gray_negative, detail=0)
-    
+
     texte_global = " ".join(resultats_normaux + resultats_negatifs)
     return isoler_plaque_nc(texte_global)
+
 
 def verifier_acces_site(recherche_texte: str, site_poste_garde: str):
     date_jour = obtenir_date_nc().strftime("%Y-%m-%d")
     saisie_epuree = epurer_chaine(recherche_texte)
-    
+    terme_recherche_lower = recherche_texte.strip().lower()
+
     try:
-        req = supabase.table("Demandes_acces") \
-            .select("*") \
-            .eq("statut", "Validé") \
-            .eq("site_id", site_poste_garde) \
-            .lte("date_entree", date_jour) \
-            .gte("date_sortie", date_jour) \
+        # Filtre Supabase optimisé : Statut validé + Filtrage par date de séjour
+        req = (
+            supabase.table("Demandes_acces")
+            .select("*")
+            .eq("statut", "Validé")
+            .eq("site_id", site_poste_garde)
+            .lte("date_entree", date_jour)
+            .gte("date_sortie", date_jour)
             .execute()
-        
+        )
+
         resultats = req.data if req.data else []
         matches = []
-        
-        for d in resultats:
-            if str(d.get("site_id")).upper() != str(site_poste_garde).upper():
-                continue
 
+        for d in resultats:
             immat_db = epurer_chaine(d.get("vehicule_immatriculation"))
             demandeur = str(d.get("email_demandeur", "")).lower()
             organisme = str(d.get("organisme", "")).lower()
             conducteur = str(d.get("vehicule_conducteur", "")).lower()
-            
-            match_immat = bool(saisie_epuree and (saisie_epuree in immat_db or immat_db in saisie_epuree))
-            match_texte = bool(recherche_texte.lower() in demandeur or 
-                               recherche_texte.lower() in organisme or 
-                               recherche_texte.lower() in conducteur)
-            
+
+            # Correspondance immatriculation (si saisie numérique/plaque)
+            match_immat = bool(
+                saisie_epuree
+                and (saisie_epuree in immat_db or immat_db in saisie_epuree)
+            )
+
+            # Correspondance texte (Nom, Organisme, Conducteur)
+            match_texte = bool(
+                terme_recherche_lower in demandeur
+                or terme_recherche_lower in organisme
+                or terme_recherche_lower in conducteur
+            )
+
             if match_immat or match_texte:
-                if verifier_creneau_horaire(d.get("heure_entree"), tolerance_minutes=15):
+                # Vérification de la fenêtre horaire (entrée ET sortie)
+                if verifier_creneau_horaire(
+                    d.get("heure_entree"), d.get("heure_sortie"), tolerance_minutes=15
+                ):
                     matches.append(d)
-                
+
         return matches, len(resultats)
     except Exception as e:
         st.error(f"❌ Erreur lors du contrôle : {e}")
         return [], 0
 
+
 # ==========================================
 # 3. INTERFACE TERRAIN (VIGILE)
 # ==========================================
-st.markdown("<h2 class='main-header'>👮‍♂️ ADITUS-CONTROL V2</h2>", unsafe_allow_html=True)
+st.markdown(
+    "<h2 class='main-header'>👮‍♂️ ADITUS-CONTROL V2</h2>", unsafe_allow_html=True
+)
 
 liste_sites = charger_sites()
 site_selectionne = st.selectbox(
-    "📍 **Votre poste de contrôle (Site actuel) :**", 
-    liste_sites,
-    index=0
+    "📍 **Votre poste de contrôle (Site actuel) :**", liste_sites, index=0
 )
 
 date_aujourdhui = obtenir_date_nc()
-st.caption(f"📅 Date du jour : **{date_aujourdhui.strftime('%d/%m/%Y')}** | Site actif : **{site_selectionne}**")
+st.caption(
+    f"📅 Date du jour : **{date_aujourdhui.strftime('%d/%m/%Y')}** | Site actif : **{site_selectionne}**"
+)
 
 tab_clavier, tab_camera = st.tabs(["⌨️ Saisie Manuelle", "📸 Scanner via Webcam"])
 
@@ -184,24 +237,32 @@ with tab_clavier:
     saisie_manuelle = st.text_input(
         "🔎 Saisir une immatriculation ou un nom :",
         placeholder="Ex : 456913NC ou Nom / Organisme...",
-        key="champ_recherche"
+        key="champ_recherche",
     )
     if saisie_manuelle:
         recherche_active = saisie_manuelle
 
 with tab_camera:
-    st.info("💡 Présentez la plaque d'immatriculation devant la webcam et cliquez sur **Prendre une photo**.")
+    st.info(
+        "💡 Présentez la plaque d'immatriculation devant la webcam et cliquez sur **Prendre une photo**."
+    )
     photo = st.camera_input("Capturer la plaque 📸", key="photo_immat")
-    
+
     if photo:
         with st.spinner("🔍 Analyse de l'image et isolation de la plaque..."):
             plaque_detectee = extraire_texte_image(photo)
-            
+
         if plaque_detectee:
             st.success(f"🤖 **Plaque détectée :** `{plaque_detectee}`")
-            recherche_active = st.text_input("Ajuster la plaque si nécessaire :", value=plaque_detectee, key="correction_ocr")
+            recherche_active = st.text_input(
+                "Ajuster la plaque si nécessaire :",
+                value=plaque_detectee,
+                key="correction_ocr",
+            )
         else:
-            st.warning("⚠️ Aucune plaque NC lisible détectée. Rapprochez la plaque ou saisissez-la manuellement.")
+            st.warning(
+                "⚠️ Aucune plaque NC lisible détectée. Rapprochez la plaque ou saisissez-la manuellement."
+            )
 
 col_search, col_clear = st.columns([3, 1])
 with col_search:
@@ -218,36 +279,50 @@ if btn_verifier or recherche_active.strip():
     if not recherche_active.strip():
         st.warning("⚠️ Veuillez effectuer une saisie ou capturer une photo.")
     else:
-        autorisations, total_site = verifier_acces_site(recherche_active, site_selectionne)
-        
+        autorisations, total_site = verifier_acces_site(
+            recherche_active, site_selectionne
+        )
+
         if autorisations:
-            st.success(f"🟢 **ACCÈS AUTORISÉ POUR {site_selectionne} ({len(autorisations)})**")
-            
+            st.success(
+                f"🟢 **ACCÈS AUTORISÉ POUR {site_selectionne} ({len(autorisations)} fiche(s) trouvée(s))**"
+            )
+
             for d in autorisations:
                 with st.container():
                     st.markdown(f"### 📍 Site : {d.get('site_id')}")
-                    
+
                     c1, c2 = st.columns(2)
                     with c1:
                         st.markdown(f"👤 **Demandeur :** {d.get('email_demandeur')}")
                         st.markdown(f"🏢 **Organisme :** {d.get('organisme')}")
-                        st.markdown(f"👥 **Personnes :** {d.get('nombre_personnes', 1)}")
-                    
+                        st.markdown(
+                            f"👥 **Personnes :** {d.get('nombre_personnes', 1)}"
+                        )
+
                     with c2:
                         st.markdown(f"🚗 **Mode :** {d.get('mode_acces')}")
-                        if d.get('mode_acces') == "Véhicule":
-                            st.markdown(f"🆔 **Plaque :** `{d.get('vehicule_immatriculation')}`")
+                        if d.get("mode_acces") == "Véhicule":
+                            st.markdown(
+                                f"🆔 **Plaque :** `{d.get('vehicule_immatriculation')}`"
+                            )
                             st.markdown(f"🚘 **Véhicule :** {d.get('vehicule_type')}")
-                            st.markdown(f"🪪 **Conducteur :** {d.get('vehicule_conducteur')}")
-                
-                d_entree = str(d.get('date_entree', ''))
-                d_sortie = str(d.get('date_sortie', ''))
-                h_entree = str(d.get('heure_entree', '00:00:00'))[:5]
-                h_sortie = str(d.get('heure_sortie', '23:59:00'))[:5]
-                
-                st.info(f"📅 **Validité :** du {d_entree} au {d_sortie}\n\n"
-                        f"🕒 **Horaires :** de {h_entree} à {h_sortie} *(Accès autorisé dès {h_entree} -15 min)*")
+                            st.markdown(
+                                f"🪪 **Conducteur :** {d.get('vehicule_conducteur')}"
+                            )
+
+                d_entree = str(d.get("date_entree", ""))
+                d_sortie = str(d.get("date_sortie", ""))
+                h_entree = str(d.get("heure_entree", "00:00:00"))[:5]
+                h_sortie = str(d.get("heure_sortie", "23:59:00"))[:5]
+
+                st.info(
+                    f"📅 **Validité :** du {d_entree} au {d_sortie}\n\n"
+                    f"🕒 **Horaires autorisés :** de {h_entree} à {h_sortie} *(Tolérance ±15 min)*"
+                )
                 st.divider()
         else:
             st.error(f"🔴 **ACCÈS REFUSÉ POUR LE SITE {site_selectionne}**")
-            st.warning(f"Aucune autorisation active ou valide actuellement à **{site_selectionne}** pour **{recherche_active}**.")
+            st.warning(
+                f"Aucune autorisation active ou valide actuellement à **{site_selectionne}** pour **{recherche_active}**."
+            )
